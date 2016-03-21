@@ -1,0 +1,7 @@
+{
+	"name": "hamt-d",
+	"description": "HAMT implementation.",
+	"authors": ["earthfront"],
+	"dependencies": {
+	}
+}
