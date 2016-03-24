@@ -15,6 +15,8 @@ import std.bitmanip:BitArray;
  */
 
 /*
+
+// Are these needed?
 uint rotl32 (uint x, byte r) {
     return (x << r) | (x >> (32 - r));
 }
@@ -32,11 +34,10 @@ ulong rotr (ulong x, byte r) {
 }
 */
 
-/* 
- * Aux implementation of popcnt.
- * TODO -- Compare perf with Dlang's sw popcnt.  
+/** 
+  Aux implementation of popcnt.
+  TODO -- Compare perf with Dlang's sw popcnt.  
  */
-
 uint getBitCountManual(uint v) {
   v = v - ((v >> 1) & 0x55555555);                    // reuse input as temporary
   v = (v & 0x33333333) + ((v >> 2) & 0x33333333);     // temp
@@ -48,13 +49,14 @@ uint getBitCountPopcnt( uint v ){
   return popcnt( v );
 }
 
-// IF __POPCNT AVAILABLE
 static this(){
   
-  if( !core.cpuid.hasPopcnt() ){
+  if( !core.cpuid.hasPopcnt() )
+  {
     alias getBitCount = getBitCountPopcnt;
   }
-  else {
+  else 
+  {
     alias getBitCount = getBitCountManual;
   }
   
@@ -85,8 +87,9 @@ package{
 * Primary HashTrie type.
 **/
 struct HashTrie(KeyType, ValueType, AllocatorType = Mallocator) 
-if( isPointer!ValueType ) {
-public:
+  if (isPointer!ValueType) 
+{
+  public:
 
     this(this) @disable;
 
@@ -174,96 +177,121 @@ package struct ArrayMappedTrie(KeyType, ValueType, AllocatorType = Mallocator)
   // TODO -- evaluate appropriateness of ".hashOf" versus custom hash implementation
   // TODO -- add function attributes, e.g. pure, nothrow, trusted, etc.
 
-public:
+  public:
 
-  this( uint depthArg, AllocatorType allocArg )
-  { depth = depthArg; allocator = allocArg; }
+    this( uint depthArg, AllocatorType allocArg )
+    { depth = depthArg; allocator = allocArg; }
 
-  bool empty() pure
-  out(result)
-  {
-    if( result )
-    { assert(internalBits == 0, "bitArray is not in sync with subTable"); }
-  }
-  body
-  { return subTable.length == 0; }
-
-  /**
-    Membership test 
-    */
-  bool opBinary (string op)(KeyType lhs)
-  if (op == "in") 
-  {
-    if (empty())
-    { return false; }
-    
-    // Hash the key
-    immutable auto index = getBitArrayIndex(lhs.hashOf(),);
-    
-    // Test bit index
-    if (bitArray[index] == 0) 
-    { return false; }
-    
-    // Switch on the type.
-    // If ValueType, found. the 
-    // Recursively search for the key
-    auto var = subTable[getTablePosition(index)];
-    return var.visit!
-    (
-      (AMT* amt) =>
-        { assert( amt !is null); return lhs in amt;},
-      (ValueType* v) =>
-        { assert( amt !is null); return true; },
-      () => 
-        { assert("Logic error. Should not have reached here."); } )();
-  }
-  unittest
-  {
-    auto a = AMT!(int,string)(0);
-    assert(a.empty());
-    assert(2 !in a); 
-  }
-  
-  /** 
-    * 
-    */
-  void insert( KeyType key, ValueType value, uint depth ){
-    // If we're empty, insert to the first slot!
-    if( items.length == 0 ){
-      // TODO - Ask the allocator for a new array of size 1. 
-      items ~= value;
-      
-      // Set the appropriate bit
-      getBitIndex( key.hash() );
-    } 
-  }
-  
-  /**
-    *
-    */
-  ValueType lookup(immutable uint hash) 
-  {
-  }
-  
-package:
-  alias AMT = ArrayMappedTrie;
-  alias             ValueOrAMT  = Variant!(AMT*,ValueType*);
-  
-private:  
-  ValueOrAMT[]      subTable;
-  uint              internalBits = 0;
-  BitArray          bitArray = BitArray( internalBits.sizeof, cast(size_t*)&internalBits );
-  
-  uint              depth;
-  AllocatorType     allocator;
-  
     /**
-      * Translates the hash to a bit pattern representing the single "on" bit (the hash).
-      * E.g. hash = 8 => bitPosition = 100000000  
+      Checks empty status by checking length of subTable. 
+      An AMT is empty only if clear'ed or is the root node.  
+      */
+    bool empty() pure
+    out(result)
+    {
+      if( result )
+      { assert(internalBits == 0, "bitArray is not in sync with subTable"); }
+    }
+    body
+    { return subTable.length == 0; }
+
+
+    /**
+      Returns value, if found. Else, null.
+      Searches tree recursively
+      */
+    ValueType* find(KeyType key)
+    {
+      if (empty())
+      { return null; }
+      
+      // Hash the key
+      immutable auto bitIndex = this.getBitArrayIndex(key.hashOf());
+      
+      // Test bit index
+      if (bitArray[bitIndex] == 0) 
+      { return null; }
+      
+      auto varIndex = getTablePosition(bitIndex);
+      assert(subTable.length() > varIndex);
+      
+      // Switch on the type of variant.
+      // If ValueType, return the value found.
+      // If AMT, recurse and search for the key deeper in the tree.
+      auto var = subTable[varIndex];
+      return var.visit!
+      (
+        (AMT* amt) =>
+          { assert( amt !is null); return amt.find(key);},
+        (ValueType* v) =>
+          { assert( v !is null); return v; },
+        () => 
+          { assert("Logic error. Empty variant case should have been covered."); } )();
+    }
+    unittest
+    {
+      auto a = AMT!(int,string)(0);
+      assert(a.empty());
+      assert(a.find(2)==null); 
+    }
+    
+    
+    /**
+      Membership test.
+      */
+    bool opBinaryRight(string op)(KeyType rhs)
+      if (op == "in" )
+    {
+      return this.find(rhs) != null;
+    }
+    unittest
+    {
+      auto a = AMT!(int,double)(0);
+      
+    
+    
+    /** 
+      * 
+      */
+    void insert( KeyType key, ValueType value, uint depth ){
+      // If we're empty, insert to the first slot!
+      if( items.length == 0 ){
+        // TODO - Ask the allocator for a new array of size 1. 
+        items ~= value;
+        
+        // Set the appropriate bit
+        getBitIndex( key.hash() );
+      } 
+    }
+    
+    /**
+      *
+      */
+    ValueType lookup(immutable uint hash) 
+    {
+    }
+    
+  package:
+    alias AMT         = ArrayMappedTrie!(KeyType,ValueType,AllocatorType);
+    alias ValueOrAMT  = Variant!(AMT*,ValueType*);
+  
+  private:  
+    ValueOrAMT[]      subTable;
+    uint              internalBits = 0;
+    BitArray          bitArray = BitArray( internalBits.sizeof, cast(size_t*)&internalBits );
+    
+    uint              depth;
+    AllocatorType     allocator;
+
+    /**
+      Translates the hash to a bit pattern representing the single "on" bit (the hash).
+      E.g. hash = 8 => bit position = 100000000
+      E.g. hash = 0 => bit position = 00000001
+      depth is used to shift the correct bits into 'view' of the mask.
       */
     uint getBitArrayIndex(uint hash)
     {
-      hash >>= Depth * HashIndexBits;
+      hash >>= depth * HashIndexBits;
       auto masked = hash & HashIndexMask;
       return 1 << masked; 
     }
@@ -288,8 +316,6 @@ private:
     {
       return getBitCount(bitArray & (hashBitPosition - 1));
     }
-    
-
 
 }
 
