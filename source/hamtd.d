@@ -62,7 +62,7 @@ string createHAMTType( uint numBits, string aliasName )
   Convenience aliases
   */
 template HAMT32(Args...)
-{ alias HAMT32 = HashTrie!(uint,Args); }
+{ alias HAMT32 = HAMT!(uint,Args); }
 
 
 /**
@@ -86,46 +86,78 @@ struct HAMT(HashType, KeyType, ValueType, AllocatorType = Mallocator)
 // TODO -- if isClass && has hashOf override && opequals override (just like AA's) 
 {
 private:
-  alias 
-  alias ThisType     = HAMT!(KeyType,ValueType,AllocatorType);
-  alias ValueOrHAMT  = Variant!(ThisType*,ValueType*);
+  import std.typecons:Tuple;
+  alias KVPair        = Tuple!(KeyType,"key",ValueType,"value");
+  alias HAMTType      = HAMT!(HashType,KeyType,ValueType,AllocatorType);
+  alias KVPairOrHAMT  = Variant!(HAMTType*,KVPair*);
+  
   // TODO -- Create POD quantity type for bits?
-  // TODO -- Perhaps increase this for 64bit?
-  immutable enum  SubHashSize = 5; // In bits
-  immutable enum  SubHashMask = (1 << SubHashSize) - 1;
+  // TODO -- Perhaps paramaterize subhashsize?
+  enum  SubHashSize = 5; // In bits
+  enum  SubHashMask = (1 << SubHashSize) - 1;
   
   // SubHashesPerHash is used to determine when to rehash the key, i.e. when the limit of unique chunks of the hash has been met. 
-  immutable enum  SubHashesPerHash      = HashType.sizeof / SubHashSize;//((uint.sizeof * 8 + 7) / SubHashSize) * SubHashSize;
-  immutable enum  RehashThresholdDepth  = SubHashesPerHash / SubHashSize;
+  enum  SubHashesPerHash      = HashType.sizeof / SubHashSize;
+  enum  RehashThresholdDepth  = SubHashesPerHash / SubHashSize;
   
   // Each Node entry in the hash table is either terminal node
   // (a ValueType pointer) or HAMT data structure.
   // A one bit in the bit map represents a valid arc, while a zero an empty arc.
   // The pointers in the table are kept in sorted order and correspond to
   // the order of each one bit in the bit map.
+
   // TODO -- optimize:
   //  * Replace BitArray (unnecessarily big, needs external uint anyway)
   //  * Optimize for alignment
   // TODO -- evaluate appropriateness of ".hashOf" versus custom hash implementation
   // TODO -- add function attributes, e.g. pure, nothrow, trusted, etc.
+
+  // Unimplemented methods to match D's AA:
+  //  remove
+  //  opIndex
+  //  opIndexAssign -- See all the rules about how structs are supported. Support value semantics
+  //  staticInitialization?
+  //  copy constructor -- Support assumeUnique
+  //  Properties:
+  //    dup
+  //    keys
+  //    values
+  //    rehash -- will be a no-op. HAMT's uilize an optimal strategy for organizing nodes.
+  //    byKey
+  //    byValue
+  //    byKeyValue
+  //    get(Key,lazy defaultValue)
   public:
     /**
       */
     this( AllocatorType a )
     {
       enforce(a !is null, "Allocator argument cannot be null");
-      this(0, a);
-    } 
+      this(0,DefaultVarArraySize,a);
+    }
+        
+    /**
+      If no allocator is specified, use default.
+      */
+    this()
+    {
+      this(0,DefaultVarArraySize,AllocatorType.instance);
+    }
     
   private
   {
+    enum DefaultVarArraySize = 0;
     /**
       Private constructor allows initialization of depth argument to be something other than 0 (root).
       */
-    this( uint depthArg, AllocatorType allocArg )
+    this(uint depthArg, size_t varArraySize, AllocatorType allocArg)
     { 
       allocator = allocArg;
       depth = depthArg;
+      if (varArraySize != 0)
+      {
+        varArray = allocateVarArray(varArraySize);
+      }
     }
     
     bool isRoot() pure nothrow @safe
@@ -136,8 +168,8 @@ private:
   /**
     Manual and automatic destruction.
     */
-  void destroy()
-  { allocator.dispose(subArray); }
+  void clear() @property 
+  { allocator.dispose(varArray); }
   ~this()
   { destroy(); }
 
@@ -145,8 +177,15 @@ private:
   /**
     Returns number of elements in entire tree. 
     */
-  auto length()
+  size_t length() const nothrow pure @property
   { return count; }
+
+
+  // The size of the memory held by all trees & values can be calculated. 
+  // Perhaps this should be returned?
+  // Currently mimics D's AA. 
+  size_t sizeof() const nothrow pure @property
+  { return size_t.sizeof; }
 
 
   /**
@@ -157,8 +196,8 @@ private:
   {
     if( result )
     { 
-      assert(internalBits == 0, "bitArray is not in sync with subArray");
-      assert(subArray.length == 0); 
+      assert(internalBits == 0, "bitArray is not in sync with varArray");
+      assert(varArray.length == 0); 
     }
   }
   body
@@ -184,24 +223,32 @@ private:
     { return null; }
     
     auto varIndex = getTablePosition(bitIndex);
-    assert(subArray.length() > varIndex);
+    assert(varArray.length() > varIndex);
     
     // Switch on the type of variant.
-    // If ValueType, return the value found.
+    // If KVPair, and keys match, return the value found.
     // If HAMT, recurse and search for the key deeper in the tree.
-    auto var = subArray[varIndex];
+    auto var = varArray[varIndex];
     return var.visit!
     (
-      (ThisType* hamt) =>
-        { assert( hamt !is null); return hamt.find(key);},
-      (ValueType* v) =>
-        { assert( v !is null); return v; },
+      (HAMTType* hamt) =>
+        { 
+          assert( hamt !is null); 
+          return hamt.find(key);
+        },
+      (KVPair* kv) =>
+        { 
+          assert( kv !is null);
+          if (kv.key == key)
+          { return kv.value; }
+          return null; 
+        },
       () => 
         { assert("Logic error. Empty variant case should have been covered."); } )();
   }
   unittest
   {
-    auto a = AMT32!(int,string)(0);
+    auto a = HAMT32!(int,string)();
     assert(a.empty());
     assert(a.find(2)==null); 
   }
@@ -217,7 +264,7 @@ private:
   }
   unittest
   {
-    auto a = AMT32!(int,double)(0);
+    auto a = HAMT32!(int,double)();
     assert( 1 !in a );
   }
   
@@ -226,45 +273,92 @@ private:
     Uses allocator to create a new table of the given desired size. 
     Old table values are copied to the new table.
     The old table is disposed via the allocator.
-      
+    Throws on memory error.
+    
     TODO -- Does marking the return type as "ref" help?
     */
-  ValueOrHAMT[] reallocateSubArray(ref ValueOrHAMT[] oldTable, size_t desiredSize )
+  KVPairOrHAMT[] reallocateVarArray(ref KVPairOrHAMT[] oldTable, size_t desiredSize )
   {
-    ValueOrHAMT[] newTable = allocator.makeArray!ValueOrHAMT(desiredSize, null);
+    auto newTable = allocateVarArray(desiredSize);
     newTable[] = oldTable;
     allocator.dispose(oldTable);
     return newTable;
   }
   
-  
-  /** 
-    * 
+  /**
+    Throws on memory error.
     */
-  void insert( KeyType key, ValueType value )
+  KVPairOrHAMT[] allocateVarArray(size_t size)
+  {
+    KVPairOrHAMT[] newTable = allocator.makeArray!KVPairOrHAMT(desiredSize, null);
+    enforce(newTable !is null, "Memory allocation failure.");
+    return newTable;
+  }
+  
+  
+
+  /** 
+    Mem allocation of the pair and new varArray occurs as late as possible.
+    Throws on memory allocation failure.
+    */
+  void insert(const ref KeyType key, const ref ValueType value, KVPair* allocatedPair = null)
   {
     auto bitIndex = getBitArrayIndex(key.hashOf());
+    auto varIndex = getTablePosition(bitIndex);
     
-    // If desired slot is not occupied, fill it.
+    // If slot is not occupied, fill it.
     if (empty() || bitArray[bitIndex] == false)
     {
-      auto varIndex = getTablePosition(bitIndex);
-      // If the subArray size is too small, realocate.
-      if ( subArray.length <= varIndex )
+      // If the varArray size is too small, realocate.
+      if (varArray.length <= varIndex)
       {
-        subArray = reallocateSubArray(subArray,subArray.length+1); 
-        // TODO -- More complex or abstract logic needed for reallocation?
+        varArray = reallocateVarArray(varArray,varArray.length+1); 
+        // TODO -- More complex or abstract logic needed for reallocation
         //    * Could shrink array. Now only grows.
         //    * Optimal desired size when growing? Shrinking?
       }
       
-      // Set the appropriate bit
+      // Insert into and mark the slot.
+      if (!allocatedPair) 
+      { allocatedPair = allocator.make!KVPair(key,value); }
+      varArray[varIndex] = allocatedPair;
       bitArray[bitIndex] = true;
       count += 1;
-      return;
     }
-    
-    
+    else
+    {
+      // Slot is occupied. Collision. 
+      //  Pivot on type.
+      auto var = varArray[varIndex];
+      var.visit!
+      (
+        (KVPair* oldPair) =>
+        {
+          // If keys match, then the caller intends to replace.
+          if (oldPair.key == key)
+          { 
+            oldPair.value = value;
+            // Don't increment count on replacement.
+            return; 
+          }
+          
+          // Create a new HAMT tree node, assume size of two. Each key has 1/32 chance to collide again.
+          // TODO -- Create better default word-aligned size
+          HAMTType* hamt = allocater.make!HAMTType(depth+1, 2, allocator);
+          enforce(hamt !is null,"Memory allocation failure");
+          varArray[varIndex] = hamt;
+          hamt.insert(oldPair.key, oldPair.value, oldPair);
+          hamt.insert(key,value,allocatedPair);
+          count++;
+        },
+        (HAMTType* hamt) =>
+        {
+          hamt.insert(key,value);
+          count++;          
+        },
+      ); 
+    }
+    return;       
   }
 
 
@@ -286,7 +380,7 @@ private:
 
   /**
     Get the position of the item in the subarray, given the hash bit position into the map.
-    The subArray is kept "sorted", in that it's sparsely populated, the filled slots are contiguous, and the filled slots are at the front of the subArray.
+    The varArray is kept "sorted", in that it's sparsely populated, the filled slots are contiguous, and the filled slots are at the front of the varArray.
     If the hash resolves to 18, but there are only 10 items in the array, the desired item index is 10.
     If the hash resolves to 5, and there are 10 items in the array, the desired item index will be less than 10. 
     */
@@ -297,7 +391,8 @@ private:
   
   
 private:
-  ValueOrHAMT[]     subArray;
+  // Array of variants
+  KVPairOrHAMT[]    varArray;
   uint              internalBits = 0;
   BitArray          bitArray = BitArray( internalBits.sizeof, cast(size_t*)&internalBits );
   
@@ -305,6 +400,11 @@ private:
   size_t            count;
   AllocatorType     allocator;
 }
+
+
+
+
+
 
 
 // struct HashTrie(HashType, KeyType, ValueType, AllocatorType = Mallocator) 
