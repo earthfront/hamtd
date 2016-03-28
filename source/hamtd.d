@@ -80,6 +80,27 @@ template HAMT32(Args...)
     - Value semantics for ValueType's will remove a layer of indirection from retrieving values, but increase the size of the resulting tables.
     - Reference semantics is the opposite: smaller table sizes, but an extra layer of indirection. 
     - Test the speed of each * different bit widths for the hash type.
+    TODO -- optimize:
+     * Replace BitArray (unnecessarily big, needs external uint anyway)
+     * Optimize for alignment
+  TODO -- evaluate appropriateness of ".hashOf" versus custom hash implementation
+  TODO -- add function attributes, e.g. pure, nothrow, trusted, etc.
+
+  Unimplemented methods to match D's AA:
+      remove
+      opIndex
+      opIndexAssign -- See all the rules about how structs are supported. Support value semantics
+      staticInitialization?
+      copy constructor -- Support assumeUnique
+    Properties:
+      dup
+      keys
+      values
+      rehash -- will be a no-op. HAMT's utilize an optimal strategy for organizing nodes.
+      byKey
+      byValue
+      byKeyValue
+      get(Key,lazy defaultValue)
   */
 struct HAMT(HashType, KeyType, ValueType, AllocatorType = Mallocator) 
 // TODO -- if ( hasMember!(KeyType, "hashOf" ) ) 
@@ -100,33 +121,7 @@ private:
   enum  SubHashesPerHash      = HashType.sizeof / SubHashSize;
   enum  RehashThresholdDepth  = SubHashesPerHash / SubHashSize;
   
-  // Each Node entry in the hash table is either terminal node
-  // (a ValueType pointer) or HAMT data structure.
-  // A one bit in the bit map represents a valid arc, while a zero an empty arc.
-  // The pointers in the table are kept in sorted order and correspond to
-  // the order of each one bit in the bit map.
 
-  // TODO -- optimize:
-  //  * Replace BitArray (unnecessarily big, needs external uint anyway)
-  //  * Optimize for alignment
-  // TODO -- evaluate appropriateness of ".hashOf" versus custom hash implementation
-  // TODO -- add function attributes, e.g. pure, nothrow, trusted, etc.
-
-  // Unimplemented methods to match D's AA:
-  //  remove
-  //  opIndex
-  //  opIndexAssign -- See all the rules about how structs are supported. Support value semantics
-  //  staticInitialization?
-  //  copy constructor -- Support assumeUnique
-  //  Properties:
-  //    dup
-  //    keys
-  //    values
-  //    rehash -- will be a no-op. HAMT's uilize an optimal strategy for organizing nodes.
-  //    byKey
-  //    byValue
-  //    byKeyValue
-  //    get(Key,lazy defaultValue)
   public:
     /**
       */
@@ -244,7 +239,7 @@ private:
           return null; 
         },
       () => 
-        { assert("Logic error. Empty variant case should have been covered."); } )();
+        { assert(0,"Logic error. Empty variant case should have been covered."); } )();
   }
   unittest
   {
@@ -355,12 +350,65 @@ private:
         {
           hamt.insert(key,value);
           count++;          
-        },
+        }
       ); 
     }
     return;       
   }
+  unittest
+  {
+    HAMT32!(int,string) hamt;
+    hamt.insert(3,"three");
+    assert(*(hamt.find(3)) == "three");
+    assert(hamt.find(2) == null);
+  }
 
+
+  /**
+    returns bool: whether an item was removed or not (because item wasn't found)
+    */
+  bool remove(const ref KeyType key)
+  {
+    // Search for node
+    auto bitIndex = getBitArrayIndex(key.hashOf());
+    auto varIndex = getTablePosition(bitIndex);
+    
+    if (empty() || bitArray[bitIndex] == false)
+    {
+      // Empty slot, no op.
+      return false;
+    }
+    // Slot occupied. Switch on type
+    {
+      auto var = variantArray[varIndex];
+      var.visit(
+        (KVPair* kv) =>
+        {
+          assert(kv !is null);
+          
+          // If key doesn't match, no-op
+          if (kv.key != key)
+          { return false; }
+          
+          allocator.dispose(kv);
+          bitArray[bitIndex] = false;
+          count -= 1;
+          return true;
+        },
+        (HAMTType* hamt)=>
+        {
+          assert(hamt !is null);
+          if (hamt.remove(key))
+          { 
+            count -= 1;
+            return true;
+          }
+          return false;
+        }
+      );
+    }
+    assert(0, "Logic error. All remove cases have been covered");
+  }
 
 private:  
   /**
@@ -369,6 +417,8 @@ private:
     E.g. hash = 0 => bit position = 00000001
     depth is used to shift the correct bits into 'view' of the mask.
     Depth beyond sizeof(uint)/SubHashSize 
+    
+    TODO -- Ensure method inlines.
     */
   uint getBitArrayIndex(uint hash)
   {      
@@ -383,6 +433,8 @@ private:
     The varArray is kept "sorted", in that it's sparsely populated, the filled slots are contiguous, and the filled slots are at the front of the varArray.
     If the hash resolves to 18, but there are only 10 items in the array, the desired item index is 10.
     If the hash resolves to 5, and there are 10 items in the array, the desired item index will be less than 10. 
+    
+    TODO -- Ensure method inlines.
     */
   auto getTablePosition( uint map, uint bitIndex )
   {
@@ -391,6 +443,13 @@ private:
   
   
 private:
+  /**
+    Each Node entry in the hash table is either terminal node
+    (a ValueType pointer) or HAMT data structure.
+    A one bit in the bit map represents a valid arc, while a zero an empty arc.
+    The pointers in the table are kept in sorted order and correspond to
+    the order of each one bit in the bit map.
+    */
   // Array of variants
   KVPairOrHAMT[]    varArray;
   uint              internalBits = 0;
@@ -400,62 +459,3 @@ private:
   size_t            count;
   AllocatorType     allocator;
 }
-
-
-
-
-
-
-
-// struct HashTrie(HashType, KeyType, ValueType, AllocatorType = Mallocator) 
-//   if (isPointer!ValueType) 
-// {
-//   public:
-
-//     this(this) @disable;
-//     this( AllocatorType a ){
-//       enforce(a !is null, "Allocator argument cannot be null");
-//       allocator = a;
-//     }
-    
-//     /**
-//       Removes tree structure. 
-//       If ValueType has reference semantics, the garbage collector will handle that memory.
-//       If it has value semantics, the 
-//       */ 
-//     void destroy()
-//     { root.destroy(); }
-//     ~this()
-//     { destroy(); }
-    
-//     /** TODO -- add index operators;
-//         TODO -- funcs to implement:
-//           * insert, remove, "in", indexOp, indexAssignOp, 
-//     */ 
-//     /** 
-//       *
-//       */
-//     bool empty() { return amt.empty(); }
-
-//     /**
-//       * Returns number of elements in tree.
-//       */
-//     @property length(){ return count; }
-    
-//     void insert(KeyType key, ValueType value) 
-//     {
-//       // forward to AMT add method
-//       root.insert(key,value);
-//       count += 1;
-//     }
-
-
-//   private:
-
-
-//   // Root Hash Table
-//   alias     AMTType = ArrayMappedTrie!(HashType,KeyType,ValueType,AllocatorType);
-//   AMTType   root    = AMTType(0,allocator); 
-//   uint      count   = 0;
-//   Allocator allocator;
-// }//struct HashTrie
