@@ -5,8 +5,11 @@ import core.bitop:popcnt;
 import std.variant;
 import std.traits;
 import std.meta;
+import std.experimental.allocator;
 import std.experimental.allocator.mallocator:Mallocator;
+import std.experimental.allocator.building_blocks.scoped_allocator:ScopedAllocator;
 import std.exception;
+import core.exception:RangeError;
 import std.bitmanip:BitArray;
 
 
@@ -32,17 +35,18 @@ uint getBitCountPopcnt( uint v ){
   return popcnt( v );
 }
 
-static this()
-{  
-  if( !core.cpuid.hasPopcnt() )
-  {
-    alias getBitCount = getBitCountPopcnt;
-  }
-  else 
-  {
-    alias getBitCount = getBitCountManual;
-  }
-}
+// static this()
+// { 
+  
+//   if( !hasPopcnt() )
+//   {
+//     alias getBitCountFun = getBitCountPopcnt;
+//   }
+//   else 
+//   {
+//     alias getBitCountFun = getBitCountManual;
+//   }
+// }
 
 /**
   CTFE function to generate types specific to the HAMT type.
@@ -76,7 +80,7 @@ template HAMT32(Args...)
   
   TODO -- Create a custom allocator: retains pools of arrays of various sizes. Minimum retention size for each pool. 
   
-  TODO -- Specialize for pointer and non-pointer ValueType's a la "static if (isPointer!ValueType)"
+  TODO -- Specialize for value semantics, e.g. "static if (isPointer!ValueType)"
     - Value semantics for ValueType's will remove a layer of indirection from retrieving values, but increase the size of the resulting tables.
     - Reference semantics is the opposite: smaller table sizes, but an extra layer of indirection. 
     - Test the speed of each * different bit widths for the hash type.
@@ -85,15 +89,13 @@ template HAMT32(Args...)
      * Optimize for alignment
   TODO -- evaluate appropriateness of ".hashOf" versus custom hash implementation
   TODO -- add function attributes, e.g. pure, nothrow, trusted, etc.
+  TODO -- Evaluate optimal use of Variant memory usage, vs pointer.
 
   Unimplemented methods to match D's AA:
-      remove
-      opIndex
       opIndexAssign -- See all the rules about how structs are supported. Support value semantics
       staticInitialization?
       copy constructor -- Support assumeUnique
     Properties:
-      dup
       keys
       values
       rehash -- will be a no-op. HAMT's utilize an optimal strategy for organizing nodes.
@@ -102,15 +104,14 @@ template HAMT32(Args...)
       byKeyValue
       get(Key,lazy defaultValue)
   */
-struct HAMT(HashType, KeyType, ValueType, AllocatorType = Mallocator) 
-// TODO -- if ( hasMember!(KeyType, "hashOf" ) ) 
-// TODO -- if isClass && has hashOf override && opequals override (just like AA's) 
+class HAMT(HashType, KeyType, ValueType, AllocatorType = ScopedAllocator!Mallocator) 
+// TODO -- if isClass && has overridden "toHash" && overridden opequals 
 {
 private:
   import std.typecons:Tuple;
   alias KVPair        = Tuple!(KeyType,"key",ValueType,"value");
   alias HAMTType      = HAMT!(HashType,KeyType,ValueType,AllocatorType);
-  alias KVPairOrHAMT  = Variant!(HAMTType*,KVPair*);
+  alias KVPairOrHAMT  = VariantN!(KVPair.sizeof,HAMTType*,KVPair);
   
   // TODO -- Create POD quantity type for bits?
   // TODO -- Perhaps paramaterize subhashsize?
@@ -119,24 +120,24 @@ private:
   
   // SubHashesPerHash is used to determine when to rehash the key, i.e. when the limit of unique chunks of the hash has been met. 
   enum  SubHashesPerHash      = HashType.sizeof / SubHashSize;
-  enum  RehashThresholdDepth  = SubHashesPerHash / SubHashSize;
+  enum  RehashThresholdDepth  = SubHashesPerHash;
   
 
   public:
     /**
       */
-    this( AllocatorType a )
-    {
-      enforce(a !is null, "Allocator argument cannot be null");
-      this(0,DefaultVarArraySize,a);
-    }
+    // this( AllocatorType a )
+    // {
+    //   enforce(a !is null, "Allocator argument cannot be null");
+    //   this(0,DefaultVarArraySize,a);
+    // }
         
     /**
-      If no allocator is specified, use default.
+      If no runtime allocator arg is specified, use global instance.
       */
     this()
     {
-      this(0,DefaultVarArraySize,AllocatorType.instance);
+       this(0,DefaultVarArraySize);
     }
     
   private
@@ -145,14 +146,27 @@ private:
     /**
       Private constructor allows initialization of depth argument to be something other than 0 (root).
       */
-    this(uint depthArg, size_t varArraySize, AllocatorType allocArg)
+    this(uint depthArg, size_t varArraySize)//, AllocatorType allocArg)
     { 
-      allocator = allocArg;
+      bitArray = BitArray( internalBits.sizeof, cast(size_t*)&internalBits );
+      //allocator = allocArg;
       depth = depthArg;
       if (varArraySize != 0)
       {
         varArray = allocateVarArray(varArraySize);
       }
+      
+      
+      // Set getBitCountFun method
+      if( !hasPopcnt() )
+      {
+        getBitCountFun = &getBitCountPopcnt;
+      }
+      else 
+      {
+        getBitCountFun = &getBitCountManual;
+      }
+      
     }
     
     bool isRoot() pure nothrow @safe
@@ -161,12 +175,14 @@ private:
   
   
   /**
-    Manual and automatic destruction.
+    Removes and deallocates all nodes and data values from the tree.
     */
   void clear() @property 
-  { allocator.dispose(varArray); }
+  {
+    allocator.dispose(varArray);
+  }
   ~this()
-  { destroy(); }
+  { clear(); }
 
   
   /**
@@ -178,13 +194,49 @@ private:
 
   // The size of the memory held by all trees & values can be calculated. 
   // Perhaps this should be returned?
-  // Currently mimics D's AA. 
-  size_t sizeof() const nothrow pure @property
-  { return size_t.sizeof; }
+  // This cannot be overloaded, it seems 
+  //size_t sizeof() const nothrow pure @property
+  //{ return size_t.sizeof; }
+
+  /** Helper alias for each
+    */
+  alias EachDelegate = void delegate(const KeyType k, const ValueType v);
+
+  /**
+    Iterate over all key value pairs.
+    Descend the depth of the tree and visit each leaf node.
+    Callable must accept as parameters:
+      ref KeyType
+      ref ValueType
+    */    
+  void each(EachDelegate d)
+  {
+    if (count==0)
+    { return; }
+    
+    auto fullSlots = this.bitArray.bitsSet();
+    foreach (s; fullSlots)
+    {
+      auto varIndex = getTablePosition(s);
+      auto var = variantArray[varIndex];
+      var.visit!(
+        (HAMTType* hamt)=>
+        {
+          assert(hamt);
+          hamt.each(d);
+        },
+        (KVPair* kv)=>
+        {
+          assert(kv);
+          d(kv.key,kv.value);
+        }
+      );
+    }
+  }
 
 
   /**
-    Checks empty status by checking count. 
+    Returns true if there are no elements in the tree. 
     */
   bool empty() pure
   out(result)
@@ -197,8 +249,108 @@ private:
   }
   body
   {
-    return count() == 0; 
+    return this.length() == 0;
   }
+  
+  // /**
+  //   TODO -- Might need to change this to a class instead of struct.
+  //   */
+  // HAMTType dup()
+  // {
+  //   auto newHamt = new HAMTType; 
+  //   auto pairs = this.byKeyValue();
+  //   foreach( ref p; pairs )
+  //   { newHamt.insert(p.key,p.value); }
+  //   return newHamt;
+  // }
+      
+  
+  /**
+    */
+    KeyType[] keys() @property
+    {      
+      KeyType[] result;
+      result.reserve(count);
+      // auto appendKey = delegate void(const KeyType a, const ValueType b){result ~= a;};
+      // this.each(appendKey);
+      this.each(delegate void(const KeyType k, const ValueType v){result ~= k;});
+      return result;
+    }
+    
+  /**
+    */
+    auto values() @property
+    {
+      ValueType[] result;
+      result.reserve(count);
+      //auto appendValue = delegate void(const KeyType a, const ValueType b){result ~= b;};
+      //this.each!(typeof(appendValue))(appendValue);
+      //auto appendValue = delegate void(const KeyType a, const ValueType b){result ~= b;};
+      this.each(delegate void(const KeyType k, const ValueType v){result ~= v;});
+      return result;
+    }
+    
+    /**
+    static struct Range(IterableType)
+    {
+      @disable this();
+      
+      TODO -- implement popFront, etc. 
+      
+      
+      private:
+        HAMTType* currentNode; // Current node in tree.
+        FILLINTYPE currentIndex;
+        
+    }
+    
+    auto byKey() @property
+    {
+      
+    }
+    
+    auto byValue() @property
+    {
+      
+    }
+    
+    auto byKeyValue() @property
+    {
+      
+    }
+    **/
+  ////// Operator overloadss
+  /**
+    "in" operator, Membership test.
+    */
+  bool opBinaryRight(string op)(const KeyType rhs)
+    if (op == "in" )
+  {
+    return this.find(rhs) != null;
+  }
+  unittest
+  {
+    auto a = HAMT32!(int,double);
+    assert( 1 !in a );
+  }
+  
+  
+  /**
+    */  
+  ValueType opIndex(const KeyType key)
+  {
+    auto valuePtr = find(key);
+    if (valuePtr == null)
+    { throw new RangeError(); }
+    return *valuePtr;
+  }
+  
+  
+  /**
+    
+    */
+  void opIndexAssign(const ValueType value, const KeyType key)
+  { this.insert(key,value); }
   
   
   /**
@@ -211,14 +363,14 @@ private:
     { return null; }
     
     // Hash the key
-    immutable auto bitIndex = this.getBitArrayIndex(key.hashOf());
+    immutable auto bitIndex = this.getBitArrayIndex(getHash(key));
     
     // Test bit index
     if (bitArray[bitIndex] == 0) 
     { return null; }
     
     auto varIndex = getTablePosition(bitIndex);
-    assert(varArray.length() > varIndex);
+    assert(varArray.length > varIndex);
     
     // Switch on the type of variant.
     // If KVPair, and keys match, return the value found.
@@ -231,9 +383,8 @@ private:
           assert( hamt !is null); 
           return hamt.find(key);
         },
-      (KVPair* kv) =>
+      (KVPair kv) =>
         { 
-          assert( kv !is null);
           if (kv.key == key)
           { return kv.value; }
           return null; 
@@ -243,25 +394,12 @@ private:
   }
   unittest
   {
-    auto a = HAMT32!(int,string)();
+    auto a = HAMT32!(int,string);
     assert(a.empty());
     assert(a.find(2)==null); 
   }
   
   
-  /**
-    Membership test.
-    */
-  bool opBinaryRight(string op)(const ref KeyType rhs)
-    if (op == "in" )
-  {
-    return this.find(rhs) != null;
-  }
-  unittest
-  {
-    auto a = HAMT32!(int,double)();
-    assert( 1 !in a );
-  }
   
   
   /** 
@@ -285,7 +423,8 @@ private:
     */
   KVPairOrHAMT[] allocateVarArray(size_t size)
   {
-    KVPairOrHAMT[] newTable = allocator.makeArray!KVPairOrHAMT(desiredSize, null);
+    import std.experimental.allocator:makeArray;
+    KVPairOrHAMT[] newTable = makeArray!(KVPairOrHAMT,AllocatorType)(allocator,size);
     enforce(newTable !is null, "Memory allocation failure.");
     return newTable;
   }
@@ -293,18 +432,19 @@ private:
   
 
   /** 
+    Inserts $(D value) into the tree using $(D key) as the key.  
     Mem allocation of the pair and new varArray occurs as late as possible.
     Throws on memory allocation failure.
     */
-  void insert(const ref KeyType key, const ref ValueType value, KVPair* allocatedPair = null)
+  void insert(const KeyType key, const ValueType value, KVPair* allocatedPair = null)
   {
-    auto bitIndex = getBitArrayIndex(key.hashOf());
+    auto bitIndex = getBitArrayIndex(getHash(key));
     auto varIndex = getTablePosition(bitIndex);
     
     // If slot is not occupied, fill it.
     if (empty() || bitArray[bitIndex] == false)
     {
-      // If the varArray size is too small, realocate.
+      // If the varArray size is too small, reallocate.
       if (varArray.length <= varIndex)
       {
         varArray = reallocateVarArray(varArray,varArray.length+1); 
@@ -365,12 +505,12 @@ private:
 
 
   /**
-    returns bool: whether an item was removed or not (because item wasn't found)
+    returns bool: whether an item was removed or not (if item not found)
     */
-  bool remove(const ref KeyType key)
+  bool remove(const KeyType key)
   {
     // Search for node
-    auto bitIndex = getBitArrayIndex(key.hashOf());
+    auto bitIndex = getBitArrayIndex(key.getHash());
     auto varIndex = getTablePosition(bitIndex);
     
     if (empty() || bitArray[bitIndex] == false)
@@ -378,39 +518,64 @@ private:
       // Empty slot, no op.
       return false;
     }
+    
     // Slot occupied. Switch on type
-    {
-      auto var = variantArray[varIndex];
-      var.visit(
-        (KVPair* kv) =>
-        {
-          assert(kv !is null);
-          
-          // If key doesn't match, no-op
-          if (kv.key != key)
-          { return false; }
-          
-          allocator.dispose(kv);
-          bitArray[bitIndex] = false;
+    auto var = variantArray[varIndex];
+    var.visit(
+      (KVPair* kv) =>
+      {
+        assert(kv !is null);
+        
+        // If key doesn't match, no-op
+        if (kv.key != key)
+        { return false; }
+        
+        allocator.dispose(kv);
+        bitArray[bitIndex] = false;
+        count -= 1;
+        
+        // TODO -- Handle case where this tree node is now empty.
+        // Signal to caller to deallocate this node
+        
+        return true;
+      },
+      (HAMTType* hamt)=>
+      {
+        assert(hamt !is null);
+        if (hamt.remove(key))
+        { 
+          //All node's count variables must be decremented.
           count -= 1;
           return true;
-        },
-        (HAMTType* hamt)=>
-        {
-          assert(hamt !is null);
-          if (hamt.remove(key))
-          { 
-            count -= 1;
-            return true;
-          }
-          return false;
         }
-      );
-    }
+        // Final failure case
+        return false;
+      }
+    );
     assert(0, "Logic error. All remove cases have been covered");
   }
 
-private:  
+private:
+  /**
+    After the depth of the tree is larger than the SubHashesPerHash, collisions must be resolved by using a different input to the hash function.
+    If the keys continue produce the same hash, collisions will continue. This is bad. For this type of collision on insertion, the tree would grow indefinitely. 
+    The Ideal Hash Trees paper recommends rehashing using the depth as an input. 
+    This function achieves that by submitting as seed the depth threshold level (not the depth, i.e. threshold levels occur every "SubHashesPerHash" depth levels).
+    This may not be a problem, but deserves some thought and stress test.
+    TODO -- Determine if hash collisions are problematic.
+    TODO -- Do not recompute hash at every depth level. It's only necessary at new depth threshold levels.
+    */
+  HashType getHash(const ref KeyType key)
+  {
+    return cast(HashType)(key.hashOf(depth / RehashThresholdDepth));
+    // auto hash = key.hashOf();
+    // immutable auto rehashSteps = depth % RehashDepthThreshold;
+    // foreach( i; 0..rehashSteps )
+    // { hash = hash.hashOf(); }
+    // return hash;
+  }
+
+
   /**
     Translates the hash to a bit pattern representing the single "on" bit (the hash).
     E.g. hash = 8 => bit position = 100000000
@@ -420,9 +585,9 @@ private:
     
     TODO -- Ensure method inlines.
     */
-  uint getBitArrayIndex(uint hash)
+  HashType getBitArrayIndex(HashType hash)
   {      
-    hash >>= depth %  * SubHashSize;
+    hash >>= (depth % RehashThresholdDepth) * SubHashSize;
     auto masked = hash & SubHashMask;
     return 1 << masked; 
   }
@@ -436,9 +601,9 @@ private:
     
     TODO -- Ensure method inlines.
     */
-  auto getTablePosition( uint map, uint bitIndex )
+  auto getTablePosition( ulong bitIndex )
   {
-    return getBitCount(bitArray & (hashBitPosition - 1));
+    return getBitCountFun( internalBits & (bitIndex - 1));
   }
   
   
@@ -453,9 +618,71 @@ private:
   // Array of variants
   KVPairOrHAMT[]    varArray;
   uint              internalBits = 0;
-  BitArray          bitArray = BitArray( internalBits.sizeof, cast(size_t*)&internalBits );
+  BitArray          bitArray;
   
   uint              depth;
   size_t            count;
   AllocatorType     allocator;
+  
+  HashType function(HashType) getBitCountFun;
 }
+
+unittest
+{
+  // Simple tests
+  {
+    HAMT32!(int,int) hamt;
+    
+    assert(hamt.empty());
+    
+    hamt[3]=3;
+    
+    assert(hamt[3] == 3);
+    assert((3 in hamt) == true);
+    assertThrown!RangeError(hamt[2]);
+    
+    hamt.remove(3);
+    
+    assert(hamt.empty());
+    assert((3 in hamt) != true );
+
+    //Test addition after removal works.    
+    hamt[3]=3;
+
+    assert((3 in hamt) == true);
+  }
+  
+  // Large number of elements
+  {
+    enum ElementMax = 99_999_999;
+    HAMT32!(int,double) hamt;
+    foreach(i;0..ElementMax)
+    {
+      hamt[i]=cast(double)i;
+    }
+    
+    foreach(i;0..ElementMax)
+    {
+      import std.stdio:write;
+      char[] msg;
+      msg.write("Checking for key: ",i);
+      assert( i in hamt,msg );
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
