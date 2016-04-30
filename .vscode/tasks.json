@@ -1,0 +1,85 @@
+// Available variables which can be used inside of strings.
+// ${workspaceRoot}: the root folder of the team
+// ${file}: the current opened file
+// ${fileBasename}: the current opened file's basename
+// ${fileDirname}: the current opened file's dirname
+// ${fileExtname}: the current opened file's extension
+// ${cwd}: the current working directory of the spawned process
+
+// A task runner that calls the Typescript compiler (tsc) and
+// Compiles a HelloWorld.ts program
+{
+    "suppressTaskName": false,
+	"version": "0.1.0",
+	"command": "dub",
+    "tasks": [ { 
+      "taskName": "build",
+      "isBuildCommand": true,
+      "args": ["--root=${workspaceRoot}"],
+      "problemMatcher": {
+        "owner": "dub",
+        "fileLocation": ["relative", "${workspaceRoot}"],
+        "pattern": {
+          "regexp": "^(.*)\\((\\d*)\\,(\\d*)\\):\\s*(Warning|Error)[:]\\s*(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+          }
+        }
+      }, 
+      { 
+        "taskName": "test",
+        "isBuildCommand": true,
+        "args": ["--root=${workspaceRoot}"],
+        "problemMatcher": {
+          "owner": "dub",
+          "fileLocation": ["relative", "${workspaceRoot}"],
+          "pattern": {
+            "regexp": "^(.*)\\((\\d*)\\,(\\d*)\\):\\s*(Warning|Error)[:]\\s*(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          }  
+        }
+      },
+      {
+        "taskName": "run",
+        "isBuildCommand": true,
+        "args": ["--root=${workspaceRoot}"],
+        "problemMatcher": {
+          "owner": "dub",
+          "fileLocation": ["relative", "${workspaceRoot}"],
+          "pattern": {
+            "regexp": "^(.*)\\((\\d*)\\,(\\d*)\\):\\s*(Warning|Error)[:]\\s*(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          }
+        }
+      },
+      {
+        "taskName": "clean",
+        "isBuildCommand": true,
+        "args": ["clean"],
+        "problemMatcher": {
+          "owner": "dub",
+          "fileLocation": ["relative", "${workspaceRoot}"],
+          "pattern": {
+            "regexp": "^(.*)\\((\\d*)\\,(\\d*)\\):\\s*(Warning|Error)[:]\\s*(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          }
+        }
+      }
+      ],
+	// The command is a shell script
+	"isShellCommand": true}
