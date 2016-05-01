@@ -198,6 +198,7 @@ private:
   //size_t sizeof() const nothrow pure @property
   //{ return size_t.sizeof; }
 
+
   /** Helper alias for each
     */
   alias EachDelegate = void delegate(const KeyType k, const ValueType v);
@@ -225,9 +226,8 @@ private:
           assert(hamt);
           hamt.each(d);
         },
-        (KVPair* kv)=>
+        (KVPair kv)=>
         {
-          assert(kv);
           d(kv.key,kv.value);
         }
       );
@@ -357,7 +357,7 @@ private:
     Returns value, if found. Else, null.
     Searches tree recursively.
     */
-  ValueType* find(const ref KeyType key)
+  ValueType* find(immutable KeyType key)
   {
     if (empty())
     { return null; }
@@ -436,7 +436,7 @@ private:
     Mem allocation of the pair and new varArray occurs as late as possible.
     Throws on memory allocation failure.
     */
-  void insert(const KeyType key, const ValueType value, KVPair* allocatedPair = null)
+  void insert(const KeyType key, const ValueType value)
   {
     auto bitIndex = getBitArrayIndex(getHash(key));
     auto varIndex = getTablePosition(bitIndex);
@@ -447,16 +447,18 @@ private:
       // If the varArray size is too small, reallocate.
       if (varArray.length <= varIndex)
       {
-        varArray = reallocateVarArray(varArray,varArray.length+1); 
+        // In this case the varIndex will always be only one element larger
+        //  than the existing array size. 
+        auto newSize = varArray.length+1;
+        varArray = reallocateVarArray(varArray,newSize); 
         // TODO -- More complex or abstract logic needed for reallocation
         //    * Could shrink array. Now only grows.
         //    * Optimal desired size when growing? Shrinking?
+        assert (varArray.length == newSize);
       }
       
-      // Insert into and mark the slot.
-      if (!allocatedPair) 
-      { allocatedPair = allocator.make!KVPair(key,value); }
-      varArray[varIndex] = allocatedPair;
+      // Insert into and mark the slot. 
+      varArray[varIndex] = KVPair(key,value);
       bitArray[bitIndex] = true;
       count += 1;
     }
@@ -467,7 +469,7 @@ private:
       auto var = varArray[varIndex];
       var.visit!
       (
-        (KVPair* oldPair) =>
+        (KVPair oldPair) =>
         {
           // If keys match, then the caller intends to replace.
           if (oldPair.key == key)
@@ -479,11 +481,11 @@ private:
           
           // Create a new HAMT tree node, assume size of two. Each key has 1/32 chance to collide again.
           // TODO -- Create better default word-aligned size
-          HAMTType* hamt = allocater.make!HAMTType(depth+1, 2, allocator);
+          HAMTType* hamt = allocator.make!HAMTType(depth+1, 2);
           enforce(hamt !is null,"Memory allocation failure");
           varArray[varIndex] = hamt;
-          hamt.insert(oldPair.key, oldPair.value, oldPair);
-          hamt.insert(key,value,allocatedPair);
+          hamt.insert(oldPair.key, oldPair.value);
+          hamt.insert(key,value);
           count++;
         },
         (HAMTType* hamt) =>
@@ -558,14 +560,14 @@ private:
 private:
   /**
     After the depth of the tree is larger than the SubHashesPerHash, collisions must be resolved by using a different input to the hash function.
-    If the keys continue produce the same hash, collisions will continue. This is bad. For this type of collision on insertion, the tree would grow indefinitely. 
-    The Ideal Hash Trees paper recommends rehashing using the depth as an input. 
     This function achieves that by submitting as seed the depth threshold level (not the depth, i.e. threshold levels occur every "SubHashesPerHash" depth levels).
-    This may not be a problem, but deserves some thought and stress test.
+    The Ideal Hash Trees paper recommends rehashing using the depth as an input. 
+    If the keys continue to produce the same hash, collisions will continue. This is bad. For this type of collision on insertion, the tree would grow indefinitely. 
+    This may not be a problem. It deserves testing. 
     TODO -- Determine if hash collisions are problematic.
     TODO -- Do not recompute hash at every depth level. It's only necessary at new depth threshold levels.
     */
-  HashType getHash(const ref KeyType key)
+  HashType getHash(inout ref KeyType key)
   {
     return cast(HashType)(key.hashOf(depth / RehashThresholdDepth));
     // auto hash = key.hashOf();
