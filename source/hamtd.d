@@ -19,6 +19,22 @@ import std.bitmanip:BitArray;
     - Implementation in C++: https://github.com/chaelim/HAMT/
  */
 
+/**
+    Workaround for allocators lack of access to data members.
+  */
+T make(T, Alloc, A...)(auto ref Alloc al, A a)
+  if (is(T == class) && !isAbstractClass!T)
+{
+  auto size = typeid(T).init.length;
+  auto memory = al.allocate(size);
+  memory[0 .. size] = typeid(T).init[];
+  T result = cast(T)(memory.ptr);
+  static if (__traits(hasMember, T, "__ctor"))
+  {  result.__ctor(a); }
+  return cast(T) memory.ptr;
+}
+
+
 
 /** 
   Aux implementation of popcnt.
@@ -67,7 +83,7 @@ string createHAMTType( uint numBits, string aliasName )
   */
 template HAMT32(Args...)
 { alias HAMT32 = HAMT!(uint,Args); }
-
+//alias HAMT32(Args...) = HAMT!(uint,Args);
 
 /**
   HAMT type.
@@ -109,9 +125,9 @@ class HAMT(HashType, KeyType, ValueType, AllocatorType = ScopedAllocator!Malloca
 {
 private:
   import std.typecons:Tuple;
-  alias KVPair        = Tuple!(KeyType,"key",ValueType,"value");
-  alias HAMTType      = HAMT!(HashType,KeyType,ValueType,AllocatorType);
-  alias KVPairOrHAMT  = VariantN!(KVPair.sizeof,HAMTType*,KVPair);
+  alias KVPair          = Tuple!(KeyType,"key",ValueType,"value");
+  alias HAMTType        = typeof(this);//HAMT!(HashType,KeyType,ValueType,AllocatorType);
+  alias KVPairOrHAMTPtr = VariantN!(KVPair.sizeof,HAMTType*,KVPair);
   
   // TODO -- Create POD quantity type for bits?
   // TODO -- Perhaps paramaterize subhashsize?
@@ -210,7 +226,7 @@ private:
       ref KeyType
       ref ValueType
     */    
-  void each(EachDelegate d)
+  void eachKV(EachDelegate func)
   {
     if (count==0)
     { return; }
@@ -219,21 +235,45 @@ private:
     foreach (s; fullSlots)
     {
       auto varIndex = getTablePosition(s);
-      auto var = variantArray[varIndex];
+      auto var = varArray[varIndex];
       var.visit!(
-        (HAMTType* hamt)=>
+        (HAMTType* hamt)
         {
           assert(hamt);
-          hamt.each(d);
+          hamt.eachKV(func);
         },
-        (KVPair kv)=>
+        (KVPair kv)
         {
-          d(kv.key,kv.value);
+          func(kv.key,kv.value);
         }
-      );
+      )();
     }
   }
 
+
+  /**
+    Calls func over all child HAMT's, then itself. 
+    */
+  void eachHAMTPostOrder(alias FuncType)(auto ref FuncType func)
+  {
+    if (count==0)
+    { assert( varArray.length == 0 ); return; }
+    
+    auto fullSlots = this.bitArray.bitsSet();
+    foreach (s; fullSlots)
+    {
+      auto varIndex = getTablePosition(s);
+      auto var = varArray[varIndex];
+      var.tryVisit!(
+        (HAMTType* hamt)
+        {
+          assert(hamt);
+          hamt.eachHAMTPostOrder(func);
+        }
+      )();
+    }
+    func(this);
+  }
 
   /**
     Returns true if there are no elements in the tree. 
@@ -273,7 +313,7 @@ private:
       result.reserve(count);
       // auto appendKey = delegate void(const KeyType a, const ValueType b){result ~= a;};
       // this.each(appendKey);
-      this.each(delegate void(const KeyType k, const ValueType v){result ~= k;});
+      this.eachKV(delegate void(const KeyType k, const ValueType v){result ~= k;});
       return result;
     }
     
@@ -286,7 +326,7 @@ private:
       //auto appendValue = delegate void(const KeyType a, const ValueType b){result ~= b;};
       //this.each!(typeof(appendValue))(appendValue);
       //auto appendValue = delegate void(const KeyType a, const ValueType b){result ~= b;};
-      this.each(delegate void(const KeyType k, const ValueType v){result ~= v;});
+      this.eachKV(delegate void(const KeyType k, const ValueType v){result ~= v;});
       return result;
     }
     
@@ -326,11 +366,11 @@ private:
   bool opBinaryRight(string op)(const KeyType rhs)
     if (op == "in" )
   {
-    return this.find(rhs) != null;
+    return !(this.find(rhs).isNull);
   }
   unittest
   {
-    auto a = HAMT32!(int,double);
+    auto a = new HAMT32!(int,double);
     assert( 1 !in a );
   }
   
@@ -339,10 +379,10 @@ private:
     */  
   ValueType opIndex(const KeyType key)
   {
-    auto valuePtr = find(key);
-    if (valuePtr == null)
+    auto maybeValue = find(key);
+    if (maybeValue.isNull)
     { throw new RangeError(); }
-    return *valuePtr;
+    return maybeValue.get();
   }
   
   
@@ -357,17 +397,19 @@ private:
     Returns value, if found. Else, null.
     Searches tree recursively.
     */
-  ValueType* find(immutable KeyType key)
+  import std.typecons:Nullable;
+  Nullable!ValueType find(immutable KeyType key)
   {
+    alias nv = Nullable!ValueType;
     if (empty())
-    { return null; }
+    { return nv(); }
     
     // Hash the key
     immutable auto bitIndex = this.getBitArrayIndex(getHash(key));
     
     // Test bit index
     if (bitArray[bitIndex] == 0) 
-    { return null; }
+    { return nv(); }
     
     auto varIndex = getTablePosition(bitIndex);
     assert(varArray.length > varIndex);
@@ -378,23 +420,23 @@ private:
     auto var = varArray[varIndex];
     return var.visit!
     (
-      (HAMTType* hamt) =>
+      (HAMTType* hamt)
         { 
           assert( hamt !is null); 
           return hamt.find(key);
         },
-      (KVPair kv) =>
+      (KVPair kv)
         { 
+          Nullable!ValueType result;
           if (kv.key == key)
-          { return kv.value; }
-          return null; 
-        },
-      () => 
-        { assert(0,"Logic error. Empty variant case should have been covered."); } )();
+          { result = kv.value; }
+          return result; 
+        } 
+    )();
   }
   unittest
   {
-    auto a = HAMT32!(int,string);
+    auto a = new HAMT32!(int,string);
     assert(a.empty());
     assert(a.find(2)==null); 
   }
@@ -410,7 +452,7 @@ private:
     
     TODO -- Does marking the return type as "ref" help?
     */
-  KVPairOrHAMT[] reallocateVarArray(ref KVPairOrHAMT[] oldTable, size_t desiredSize )
+  KVPairOrHAMTPtr[] reallocateVarArray(ref KVPairOrHAMTPtr[] oldTable, size_t desiredSize )
   {
     auto newTable = allocateVarArray(desiredSize);
     newTable[] = oldTable;
@@ -421,10 +463,10 @@ private:
   /**
     Throws on memory error.
     */
-  KVPairOrHAMT[] allocateVarArray(size_t size)
+  KVPairOrHAMTPtr[] allocateVarArray(size_t size)
   {
     import std.experimental.allocator:makeArray;
-    KVPairOrHAMT[] newTable = makeArray!(KVPairOrHAMT,AllocatorType)(allocator,size);
+    KVPairOrHAMTPtr[] newTable = makeArray!KVPairOrHAMTPtr(allocator,size);
     enforce(newTable !is null, "Memory allocation failure.");
     return newTable;
   }
@@ -442,6 +484,8 @@ private:
     auto varIndex = getTablePosition(bitIndex);
     
     // If slot is not occupied, fill it.
+    // Short circuits if the number of elements is zero. 
+    // The other scenario is there exists enough memory to store the new info.
     if (empty() || bitArray[bitIndex] == false)
     {
       // If the varArray size is too small, reallocate.
@@ -469,7 +513,7 @@ private:
       auto var = varArray[varIndex];
       var.visit!
       (
-        (KVPair oldPair) =>
+        (KVPair oldPair) 
         {
           // If keys match, then the caller intends to replace.
           if (oldPair.key == key)
@@ -479,19 +523,19 @@ private:
             return; 
           }
           
-          // Create a new HAMT tree node, assume size of two. Each key has 1/32 chance to collide again.
+          // Create a new HAMT tree node, assume size of two. Each key has 1/(HASHType.sizeof(most likely 32)) chance to collide again.
           // TODO -- Create better default word-aligned size
-          HAMTType* hamt = allocator.make!HAMTType(depth+1, 2);
+          auto hamt = allocator.make!HAMTType(depth+1, 2);
           enforce(hamt !is null,"Memory allocation failure");
-          varArray[varIndex] = hamt;
+          varArray[varIndex] = &hamt;
           hamt.insert(oldPair.key, oldPair.value);
           hamt.insert(key,value);
-          count++;
+          count += 1;
         },
-        (HAMTType* hamt) =>
+        (HAMTType* hamt) 
         {
           hamt.insert(key,value);
-          count++;          
+          count += 1;          
         }
       ); 
     }
@@ -501,20 +545,24 @@ private:
   {
     HAMT32!(int,string) hamt;
     hamt.insert(3,"three");
-    assert(*(hamt.find(3)) == "three");
-    assert(hamt.find(2) == null);
+    assert(hamt.find(3).get() == "three");
+    assert(hamt.find(2).isNull);
+    assert(3 in hamt);
+    assertThrown!RangeError(2 in hamt);
   }
 
 
   /**
+    Removes value in the tree corresponding to the given node.
     returns bool: whether an item was removed or not (if item not found)
     */
   bool remove(const KeyType key)
   {
     // Search for node
-    auto bitIndex = getBitArrayIndex(key.getHash());
+    auto bitIndex = getBitArrayIndex(getHash(key));
     auto varIndex = getTablePosition(bitIndex);
     
+    // If there are no items, or the given slot exists and is unoccupied
     if (empty() || bitArray[bitIndex] == false)
     {
       // Empty slot, no op.
@@ -522,31 +570,32 @@ private:
     }
     
     // Slot occupied. Switch on type
-    auto var = variantArray[varIndex];
-    var.visit(
-      (KVPair* kv) =>
-      {
-        assert(kv !is null);
-        
+    auto var = varArray[varIndex];
+    var.visit!(
+      (KVPair kv) 
+      {        
         // If key doesn't match, no-op
         if (kv.key != key)
         { return false; }
         
-        allocator.dispose(kv);
         bitArray[bitIndex] = false;
         count -= 1;
         
-        // TODO -- Handle case where this tree node is now empty.
-        // Signal to caller to deallocate this node
-        
         return true;
       },
-      (HAMTType* hamt)=>
+      (HAMTType* hamt)
       {
         assert(hamt !is null);
         if (hamt.remove(key))
         { 
-          //All node's count variables must be decremented.
+          // Remove succeeded. Reclaim empty node memory.
+          if (hamt.empty())
+          { 
+            allocator.dispose(hamt);
+            bitArray[bitIndex] = false;
+          }
+          
+          // All node's count variables must be decremented.
           count -= 1;
           return true;
         }
@@ -567,7 +616,7 @@ private:
     TODO -- Determine if hash collisions are problematic.
     TODO -- Do not recompute hash at every depth level. It's only necessary at new depth threshold levels.
     */
-  HashType getHash(inout ref KeyType key)
+  HashType getHash(KType)(auto ref KType key)
   {
     return cast(HashType)(key.hashOf(depth / RehashThresholdDepth));
     // auto hash = key.hashOf();
@@ -618,7 +667,7 @@ private:
     the order of each one bit in the bit map.
     */
   // Array of variants
-  KVPairOrHAMT[]    varArray;
+  KVPairOrHAMTPtr[] varArray;
   uint              internalBits = 0;
   BitArray          bitArray;
   
