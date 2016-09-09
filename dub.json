@@ -1,7 +1,12 @@
 {
-	"name": "hamt-d",
-	"description": "HAMT implementation.",
-	"authors": ["earthfront"],
-	"dependencies": {
-	}
+    "name": "hamt-d",
+    "description": "HAMT implementation.",
+    "authors": ["earthfront"],
+    "dependencies": {
+    },
+    "targetType": "executable",
+    "buildOptions":[
+	"debugMode",
+	"unittests"	
+	]    
 }
