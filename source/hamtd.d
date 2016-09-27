@@ -364,7 +364,7 @@ public:
       
        }
     **/
-    ////// Operator overloadss
+    ////// Operator overloads
     /**
        "in" operator, Membership test.
     */
@@ -376,7 +376,7 @@ public:
 
     @("Test 'in' operator")
     unittest{
-        HAMT32!(int, double) a;
+        const HAMT32!(int, double) a;
         assert(1 !in a);
     }
 
@@ -490,6 +490,11 @@ public:
     */
     KVPairPtrOrHAMTPtr[] allocateVarArray(size_t size)
     {
+        static if (stateSize!AllocatorType == 0)
+            alias alloc = AllocatorType.instance;
+        else
+            alias alloc = allocator;
+        
         auto newTable = allocator.makeArray!KVPairPtrOrHAMTPtr(size);
         enforce(newTable !is null, "Memory allocation failure.");
         return newTable;
@@ -907,20 +912,21 @@ private:
     /**
        Current level in the tree.
     */
-    uint depth;
+    uint depth = 0 ;
 
     /** 
         Number of K/V pairs contained in this node and all children.
     */
-    size_t count;
+    size_t count = 0;
 
     /**
        User specified allocator
     */
     static if (stateSize!AllocatorType == 0)
-        shared AllocatorType allocator;
-    else
-        shared ScopedAllocator!AllocatorType allocator;
+        alias allocator = AllocatorType.instance;
+    else{
+        AllocatorType allocator;
+    }
 
     /**
        Implementation of popcnt, HW or otherwise. 
@@ -977,13 +983,12 @@ private:
     }
 }
 
-// Bit functions
+// bit functions
 import std.traits : isUnsigned;
 
-bool getBitAt(T)(T bits, uint index) pure nothrow if (isUnsigned!T)
-    {
-        return (bits & (1 << index)) != 0;
-    }
+bool getBitAt(T)(T bits, uint index) pure nothrow if (isUnsigned!T){
+    return (bits & (1 << index)) != 0;
+ }
 
 @("Test bit retrieval operation")
 unittest
@@ -1048,18 +1053,33 @@ version (unittest)
     @("Test large number of elements")
         unittest
             {
-                enum ElementMax = 9;
-                // enum ElementMax = 99_999_999;
+                enum ElementMax = 99_999;
                 HAMT32!(int, double) hamt;
                 foreach (i; 0 .. ElementMax)
-                    {
                         hamt[i] = cast(double) i;
-                    }
 
                 foreach (i; 0 .. ElementMax)
-                    {
                         assert(i in hamt);
-                    }
             }
+    
+    
+    import std.experimental.allocator;
+    import std.experimental.allocator.building_blocks.segregator:Segregator;
+    import std.experimental.allocator.building_blocks.free_list : FreeList;
+ 
+    @("Test static allocator")
+        unittest{
+            import std.random:uniform;
+            alias AType =
+                Segregator!(
+                            64, FreeList!(Mallocator,0,64),
+                            128, FreeList!(Mallocator,0,128),
+                            256, FreeList!(Mallocator,0,256),
+                            Mallocator);
+            HAMT32!(uint, ulong, AType) hamt;
+            
+            foreach( i; 0..99_999 )
+                hamt[i] = uniform(0,1_000_000);
+        }
     }
 
