@@ -490,11 +490,6 @@ public:
     */
     KVPairPtrOrHAMTPtr[] allocateVarArray(size_t size)
     {
-        static if (stateSize!AllocatorType == 0)
-            alias alloc = AllocatorType.instance;
-        else
-            alias alloc = allocator;
-        
         auto newTable = allocator.makeArray!KVPairPtrOrHAMTPtr(size);
         enforce(newTable !is null, "Memory allocation failure.");
         return newTable;
